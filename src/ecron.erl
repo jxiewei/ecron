@@ -685,10 +685,72 @@ code_change(_OldVsn, State, _Extra) ->
 %%==============================================================================
 %% Internal functions
 %%==============================================================================
+
+%% Find DayOfMonth correseponding to this DayOfWeek, Basedate is starting date.
+%% Gap is the gap for the next try if initial finding failed.
+duedow(Startingdate, Dow) -> duedow(Startingdate, Dow, 'undefined').
+duedow({Year, Month, Day}=Startingdate, Dow, Gap) ->
+    Startingdow = calendar:day_of_the_week(Startingdate),  
+    Duedate = 
+    if 
+        Dow < Startingdow ->
+            {Year, Month, Day+7-(Startingdow-Dow)};
+        Dow >= Startingdow ->
+            {Year, Month, Day+(Dow-Startingdow)}
+    end,
+    case calendar:valid_date(Duedate) of
+        true -> {'ok', Duedate};
+        false -> 
+            case Gap of
+                'undefined' -> 'error';
+                _ -> next_duedow(Duedate, Gap)
+            end
+    end.
+
+%% Nothing is variable, week is always variable, it's dow anyway!
+next_duedow({Year, Month, Day}) ->
+    case calendar:valid_date({Year, Month, Day+7}) of
+        true -> {'ok', {Year, Month, Day+7}};
+        false -> 'error'
+    end.
+    
+%% Month and Year is variable.
+next_duedow({Year, Month, Day}=Date, 'monthyear') ->
+    Dow = calendar:day_of_the_week(Date),
+    case calendar:valid_date({Year, Month, Day+7}) of
+        true -> {'ok', {Year, Month, Day+7}};
+        false -> 
+            case calendar:valid_date({Year, Month+1, 1}) of
+                true -> duedow({Year, Month+1, 1}, Dow);
+                false -> duedow({Year+1, 1, 1}, Dow)
+            end
+    end;
+%% Only month is variable.
+next_duedow({Year, Month, Day}=Date, 'month') ->
+    Dow = calendar:day_of_the_week(Date),
+    case calendar:valid_date({Year, Month, Day+7}) of
+        true -> {Year, Month, Day+7};
+        false -> 
+            case calendar:valid_date({Year, Month+1, 1}) of
+                true -> duedow({Year, Month+1, 1}, Dow);
+                false -> 'error'
+            end
+    end;
+%% Only year is variable.
+next_duedow({Year, Month, Day}, 'year') ->
+    Dow = calendar:day_of_the_week({Year, Month, Day}),
+    case calendar:valid_date({Year, Month, Day+7}) of
+        true -> {'ok', {Year, Month, Day+7}};
+        false -> duedow({Year+1, Month, 1}, Dow)
+    end.
+
 sec() ->
     calendar:datetime_to_gregorian_seconds(ecron_time:localtime()).
 sec({'*', Time}) ->
     sec({{'*','*','*'}, Time});
+
+sec({{'*', '*', '*', '*'}, Time}) ->
+    sec({{'*', '*', '*'}, Time});
 
 sec({{'*','*','*'}, Time}) ->
     {Date1, Time1} = ecron_time:localtime(),
@@ -717,6 +779,21 @@ sec({{'*','*',Day}, Time}) ->
             Due
     end;
 
+sec({{'*', '*', '*', Dow}, Time}) ->
+    {Date1, Time1} = ecron_time:localtime(),
+    {'ok', D} = duedow(Date1, Dow, 'monthyear'),
+    Duedate = 
+    case 
+        calendar:datetime_to_gregorian_seconds({D, Time}) >=
+        calendar:datetime_to_gregorian_seconds({Date1, Time1}) of
+        true ->
+            D;
+        _ ->
+            {'ok', Nd} = next_duedow(D, 'monthyear'),
+            Nd
+    end,
+    calendar:datetime_to_gregorian_seconds({Duedate, Time});
+
 sec({{'*', Month, Day}, Time}) ->
     {{Year1, Month1, Day1}, Time1} = ecron_time:localtime(),
     Now = calendar:datetime_to_gregorian_seconds({{Year1, Month1, Day1}, Time1}),
@@ -729,6 +806,50 @@ sec({{'*', Month, Day}, Time}) ->
         _Diff ->
             Due
     end;
+
+sec({{'*', Month, '*', Dow}, Time}) ->
+    {{Year1, Month1, _Day1}=Date1, Time1} = ecron_time:localtime(),
+    if
+        Month < Month1 ->
+            {'ok', D} = duedow({Year1+1, Month, 1}, Dow),
+            calendar:datetime_to_gregorian_seconds({D, Time});
+        Month > Month1 ->
+            {'ok', D} = duedow({Year1, Month, 1}, Dow),
+            calendar:datetime_to_gregorian_seconds({D, Time});
+        Month == Month1 ->
+            {'ok', D} = duedow(Date1, Dow, 'year'), %jump to next year
+            Duedate = case
+                    calendar:datetime_to_gregorian_seconds({D, Time}) > 
+                    calendar:datetime_to_gregorian_seconds({Date1, Time1}) of
+                true ->
+                    D;
+                _ ->
+                    next_duedow(D, 'year')
+            end,
+            calendar:datetime_to_gregorian_seconds({Duedate, Time})
+    end;
+
+sec({{Year, Month, '*', Dow}, Time}) ->
+    {{Year1, Month1, _Day1}=Date1, Time1} = ecron_time:localtime(),
+    if 
+        (Year1 == Year) and (Month1 == Month)->
+            {'ok', D} = duedow(Date1, Dow),
+            case
+                calendar:datetime_to_gregorian_seconds({D, Time}) >= 
+                calendar:datetime_to_gregorian_seconds({Date1, Time1}) of
+                true ->
+                    calendar:datetime_to_gregorian_seconds({D, Time});
+                _ ->
+                    {'ok', Nd} = next_duedow(D),
+                    calendar:datetime_to_gregorian_seconds({Nd, Time})
+            end;
+        true ->
+            {'ok', D} = duedow({Year, Month, 1}, Dow),
+            calendar:datetime_to_gregorian_seconds({D, Time})
+    end;
+
+sec({{Year, Month, Dom, _}, Time}) ->
+    sec({{Year, Month, Dom}, Time});
 
 sec({{Year, Month, Day}, Time}) ->
     RealDay = get_real_day(Year, Month, Day),
@@ -937,7 +1058,7 @@ validate(Date, Time) ->
         true ->
             Now = sec(),
             case catch sec({Date, Time}) of
-                {'EXIT', _} ->
+                {'EXIT', _Reason} ->
                     {error, date};
                 Sec when Sec - Now >0 ->
                     ok;
@@ -947,6 +1068,13 @@ validate(Date, Time) ->
         false ->
             {error, date}
     end.
+
+validate_date({Year, Month, Day, Dow}) when is_integer(Dow), Dow>0, Dow=<7 ->
+    validate_date({Year, Month, Day});
+validate_date({Year, Month, Day, '*'}) ->
+    validate_date({Year, Month, Day});
+validate_date({_Year, _Month, _Day, _Dow}) ->
+    false;
 
 validate_date({'*','*', '*'}) ->
     true;
@@ -1025,8 +1153,11 @@ get_timeout(DueSec) ->
     end.
 
 create_table(Table, Opts) ->
-    {atomic, ok} = mnesia:create_table(Table, Opts),
-    ok.
+    case mnesia:create_table(Table, Opts) of
+        {atomic, ok} -> ok;
+        {aborted, {already_exists, _}} -> ok;
+        E -> E
+    end.
 
 %% Check whether it's the first attempt to execute a job and not a retried one
 is_not_retried(#job{client_fun = undefined, key = {DueSec, _},
